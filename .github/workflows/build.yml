@@ -1,0 +1,810 @@
+# Runs in SpanDock/spandock-releases (on its main branch, as
+# .github/workflows/build.yml). It builds, tests, and packages the private
+# source on GitHub's free public-repository runners, and can publish the
+# result as the release installed apps update from.
+#
+# The source is read with SOURCE_DEPLOY_KEY, a read-only deploy key on
+# SpanDock/spandock. This repository is public, so its run logs are public:
+# steps print versions and test results only, never source or secrets.
+# Only people with write access to this repository can start a run.
+#
+# Speed: the plan job decides what runs (the release skill, "What a run runs").
+# The Go tests run as four parallel jobs per platform (scripts/test-shard.sh)
+# beside the build job, which only builds, packages and checks the binary;
+# publishing waits for all of them. Intel Macs run the tests only for a
+# vX.Y.0 tag or a full run (every run still builds, packages, smoke-tests
+# and footprint-checks Intel). A run asked for without full or publish
+# (landing a pull request) runs the QA lab (eight parts) and the
+# compatibility matrix on Linux only; nightly runs, full runs and every
+# release run them on every OS. fast runs only Linux amd64: its tests and
+# one part of the QA lab, no packaging; publish ignores it. The
+# compatibility matrix keeps the older versions it built (qa/cache)
+# between runs.
+# The repository variable MAC_RUNNER (JSON labels, e.g.
+# ["self-hosted","macOS","ARM64"]) moves the Apple Silicon jobs to a
+# self-hosted Mac, except when publishing: release builds always run on
+# GitHub's runners.
+name: Build
+# Each run says what it is ("Publish v0.68.0", "Fast CI my-branch", "CI main",
+# "Nightly"): scripts/release-report.go matches runs to releases by it
+# (docs/RELEASE_STATUS.md). Refs only, never a secret.
+run-name: ${{ github.event_name == 'schedule' && 'Nightly' || format('{0} {1}', inputs.publish && 'Publish' || (inputs.fast && 'Fast CI' || 'CI'), inputs.ref || 'main') }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Source branch, tag, or commit in SpanDock/spandock (a v* tag to release)"
+        required: true
+        default: main
+      publish:
+        description: "Publish a release (only for a v* tag)"
+        type: boolean
+        default: false
+      compat:
+        description: "Also run the compatibility matrix (always before publishing)"
+        type: boolean
+        default: false
+      full:
+        description: "QA lab and compatibility on every OS, and the tests on Intel Macs (always nightly and before publishing the QA lab and compatibility; otherwise Linux only)"
+        type: boolean
+        default: false
+      fast:
+        description: "Fast: Linux amd64 only, its tests and one part of the QA lab, no packaging (ignored when publishing)"
+        type: boolean
+        default: false
+      smoke:
+        description: "Also run the browser extension's live adapter smoke test (always nightly)"
+        type: boolean
+        default: false
+  # Nightly on the source's main: the tests, the QA lab and the
+  # compatibility matrix (docs/QA.md). Scheduled runs have no inputs, so
+  # every ref below defaults to main and nothing is published.
+  schedule:
+    - cron: "23 2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.ref || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  # What this run runs, as matrices for the jobs below. It prints counts
+  # only. The ref is read from the environment, never pasted into the script.
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      test: ${{ steps.plan.outputs.test }}
+      qa: ${{ steps.plan.outputs.qa }}
+      compat: ${{ steps.plan.outputs.compat }}
+    steps:
+      - name: Plan
+        id: plan
+        env:
+          REF: ${{ inputs.ref || 'main' }}
+          EVENT: ${{ github.event_name }}
+          PUBLISH: ${{ inputs.publish || false }}
+          FULL: ${{ inputs.full || false }}
+          FAST: ${{ inputs.fast || false }}
+        run: |
+          fast=false
+          if [ "$FAST" = true ] && [ "$PUBLISH" != true ]; then fast=true; fi
+          # The QA lab and compatibility on every OS: nightly, full and publishing.
+          wide=false
+          if [ "$EVENT" = schedule ] || [ "$FULL" = true ] || [ "$PUBLISH" = true ]; then wide=true; fi
+          # The tests on Intel Macs: a vX.Y.0 tag (or its prerelease) or a full run.
+          intel=false
+          if [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.0(-.*)?$ ]] || [ "$FULL" = true ]; then intel=true; fi
+          platforms='[{"os":"macos","arch":"arm64","runner":"macos-15"},{"os":"macos","arch":"amd64","runner":"macos-15-intel"},{"os":"linux","arch":"amd64","runner":"ubuntu-24.04"},{"os":"linux","arch":"arm64","runner":"ubuntu-24.04-arm"},{"os":"windows","arch":"amd64","runner":"windows-2025"}]'
+          qaparts() { jq -nc --arg os "$1" --arg runner "$2" --argjson n "$3" '[range(1; $n + 1) as $i | {os: $os, runner: $runner, shard: "\($i)/\($n)", part: "\($i)"}]'; }
+          if [ "$fast" = true ]; then
+            build='[]'
+            tested=$(jq -c '[.[] | select(.os == "linux" and .arch == "amd64")]' <<<"$platforms")
+            qa=$(qaparts linux ubuntu-24.04 8 | jq -c '.[:1]')
+          else
+            build=$platforms
+            tested=$(jq -c --argjson intel "$intel" '[.[] | select($intel or .runner != "macos-15-intel")]' <<<"$platforms")
+            qa=$(qaparts linux ubuntu-24.04 8)
+            if [ "$wide" = true ]; then
+              qa=$(jq -sc 'add' <<<"$qa $(qaparts macos macos-15 2) $(qaparts windows windows-2025 4)")
+            fi
+          fi
+          test=$(jq -c '[.[] as $p | range(1; 5) as $i | $p + {shard: $i, of: 4}]' <<<"$tested")
+          compat='[{"os":"linux","runner":"ubuntu-24.04"}]'
+          if [ "$wide" = true ]; then compat='[{"os":"linux","runner":"ubuntu-24.04"},{"os":"macos","runner":"macos-15"}]'; fi
+          {
+            echo "build=$build"
+            echo "test=$test"
+            echo "qa=$qa"
+            echo "compat=$compat"
+          } >> "$GITHUB_OUTPUT"
+          echo "fast=$fast, every OS=$wide, Intel tests=$intel: $(jq length <<<"$build") builds, $(jq length <<<"$test") test parts, $(jq length <<<"$qa") QA lab parts"
+
+  build:
+    name: ${{ matrix.os }} ${{ matrix.arch }}
+    needs: plan
+    if: needs.plan.outputs.build != '[]'
+    runs-on: ${{ (matrix.runner == 'macos-15' && vars.MAC_RUNNER && !inputs.publish) && fromJSON(vars.MAC_RUNNER) || matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.build) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Windows: Defender's real-time scan slows Go builds and tests a lot.
+      # Leave out the workspace, Go's build and module caches, the runner's
+      # temp folder and its tool cache (where setup-go installs Go). Quiet;
+      # an image without Defender doesn't fail the job.
+      - name: Leave Go's folders out of Defender (Windows)
+        if: matrix.os == 'windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $paths = @($env:GITHUB_WORKSPACE, $env:RUNNER_TEMP, $env:RUNNER_TOOL_CACHE, (Join-Path $env:LOCALAPPDATA 'go-build'), (Join-Path $env:USERPROFILE 'go'))
+          Add-MpPreference -ExclusionPath $paths -ErrorAction Stop
+          Write-Output "Defender exclusions added"
+
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          repository: SpanDock/spandock
+          ref: ${{ inputs.ref || 'main' }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify toolchain
+        run: |
+          test "$(go env GOARCH)" = "${{ matrix.arch }}"
+          go version
+          gcc --version | head -1
+
+      # SPANDOCK_LICENSE_KEYS are the public keys that sign licenses
+      # ("kid:base64"); without them a release accepts no license key.
+      # Developer ID signing and notarization (packaging/macos), only when
+      # publishing and only while the secrets exist; otherwise ad-hoc, as
+      # before. The certificate goes into a temporary keychain that lives
+      # and dies with the runner. Prints the identity count only.
+      - name: Signing keychain (macOS)
+        id: signing
+        if: matrix.os == 'macos' && inputs.publish
+        env:
+          APP_P12: ${{ secrets.MACOS_APP_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_P12_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+        run: |
+          if [ -z "$APP_P12" ] || [ -z "$P12_PASSWORD" ] || [ -z "$NOTARY_KEY_P8" ]; then echo "No Developer ID secrets: signing ad-hoc"; exit 0; fi
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          kp=$(openssl rand -hex 16)
+          security create-keychain -p "$kp" "$kc"
+          security set-keychain-settings -lut 7200 "$kc"
+          security unlock-keychain -p "$kp" "$kc"
+          printf '%s' "$APP_P12" | base64 --decode > "$RUNNER_TEMP/app.p12"
+          security import "$RUNNER_TEMP/app.p12" -k "$kc" -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null
+          rm -f "$RUNNER_TEMP/app.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kp" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          identity=$(security find-identity -v -p codesigning "$kc" | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          if [ -z "$identity" ]; then echo "The certificate holds no Developer ID Application identity: signing ad-hoc"; exit 0; fi
+          umask 077
+          printf '%s' "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+          echo "notary=$RUNNER_TEMP/notary.p8" >> "$GITHUB_OUTPUT"
+          echo "Signing with 1 Developer ID identity, notarizing"
+
+      - name: Package (macOS)
+        if: matrix.os == 'macos'
+        env:
+          SPANDOCK_LICENSE_KEYS: ${{ secrets.SPANDOCK_LICENSE_KEYS }}
+          SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+          NOTARY_KEY: ${{ steps.signing.outputs.notary }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: ./scripts/package-macos.sh
+
+      - name: Package (Linux)
+        if: matrix.os == 'linux'
+        env:
+          SPANDOCK_LICENSE_KEYS: ${{ secrets.SPANDOCK_LICENSE_KEYS }}
+        run: ./scripts/package-unix.sh
+
+      # The sales demo servers' seeder and satellite template
+      # (docs/plans/SALES_DEMO.md): Linux only, beside spandock.
+      - name: Package the demo seeder (Linux)
+        if: matrix.os == 'linux'
+        run: ./scripts/package-demo.sh
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          SPANDOCK_LICENSE_KEYS: ${{ secrets.SPANDOCK_LICENSE_KEYS }}
+        run: ./scripts/package-windows.ps1
+
+      - name: Smoke test the release binary
+        env:
+          SPANDOCK_SECRET_STORE: file
+        run: |
+          cd "$RUNNER_TEMP"
+          case "${{ matrix.os }}" in
+            macos) ditto -x -k "$GITHUB_WORKSPACE/dist/release/SpanDock-macos-${{ matrix.arch }}.zip" . && bin="./SpanDock.app/Contents/MacOS/SpanDock" ;;
+            linux) tar -xzf "$GITHUB_WORKSPACE/dist/release/spandock-linux-${{ matrix.arch }}.tar.gz" && bin=./spandock ;;
+            windows) pwsh -NoProfile -Command "Expand-Archive -Path '$GITHUB_WORKSPACE/dist/release/spandock-windows-${{ matrix.arch }}.zip' -DestinationPath ." && bin=./spandock.exe ;;
+          esac
+          "$bin" -version
+          ok=true
+          # First launch: onboarding only. Nothing else may listen.
+          "$bin" -open=false -menubar=false -config-dir "$RUNNER_TEMP/fresh" -web-addr 127.0.0.1:18787 -otlp-addr 127.0.0.1:14318 > onboarding.log 2>&1 &
+          pid=$!
+          for _ in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:18787/api/status && break; sleep 1; done
+          curl -fsS http://127.0.0.1:18787/api/status | grep -q '"onboarding":true' || ok=false
+          if curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:14318/healthz; then echo "onboarding started the OTLP receiver"; ok=false; fi
+          kill "$pid" || true
+          wait "$pid" 2>/dev/null || true
+          # A headless first start must accept the EULA.
+          "$bin" -role=server -open=false -menubar=false -config-dir "$RUNNER_TEMP/no-eula" -web-addr 127.0.0.1:18787 -otlp-addr 127.0.0.1:14318 > no-eula.log 2>&1 &
+          pid=$!
+          for _ in $(seq 1 15); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+          if kill -0 "$pid" 2>/dev/null; then echo "started without accepting the EULA"; ok=false; kill "$pid" || true; fi
+          wait "$pid" 2>/dev/null || true
+          grep -q 'spandock.com/legal/eula' no-eula.log || { echo "no EULA message"; ok=false; }
+          # Standalone mode is retired: -role=standalone exits at once.
+          if "$bin" -role=standalone -accept-eula -open=false -menubar=false -config-dir "$RUNNER_TEMP/standalone" > standalone.log 2>&1; then echo "-role=standalone started"; ok=false; fi
+          # The onboarding page's files are embedded.
+          "$bin" -open=false -menubar=false -config-dir "$RUNNER_TEMP/fresh2" -web-addr 127.0.0.1:18787 -otlp-addr 127.0.0.1:14318 > onboarding2.log 2>&1 &
+          pid=$!
+          for _ in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:18787/api/status && break; sleep 1; done
+          curl -fsS -o /dev/null http://127.0.0.1:18787/js/app.js || { echo "no dashboard files"; ok=false; }
+          kill "$pid" || true
+          wait "$pid" 2>/dev/null || true
+          # Every server needs a spandock.com account: a new headless server
+          # prints the activation link and code, and waits before it starts
+          # anything. A local fake stands in for spandock.com; a release build
+          # accepts it only from SPANDOCK_LICENSE_SERVER on a loopback address,
+          # still checks that the link is on the fake's host, and would accept
+          # only tokens signed with its built-in keys. The fake's device code is
+          # a public test value; the app must never print it.
+          go run "$GITHUB_WORKSPACE/scripts/fake-license-server.go" 127.0.0.1:18790 > fake-license.log 2>&1 &
+          fake=$!
+          for _ in $(seq 1 90); do curl -fsS -o /dev/null http://127.0.0.1:18790/healthz && break; sleep 1; done
+          SPANDOCK_LICENSE_SERVER=http://127.0.0.1:18790 "$bin" -role=server -accept-eula -open=false -menubar=false -config-dir "$RUNNER_TEMP/smoke" -web-addr 127.0.0.1:18787 -otlp-addr 127.0.0.1:14318 > smoke.log 2>&1 &
+          pid=$!
+          for _ in $(seq 1 30); do grep -q 'BCDF-2345' smoke.log && break; sleep 1; done
+          grep -q 'http://127.0.0.1:18790/activate?code=BCDF-2345' smoke.log || { echo "no activation link and code"; ok=false; }
+          kill -0 "$pid" 2>/dev/null || { echo "the new server didn't wait for its activation"; ok=false; }
+          if grep -q 'smoke-device-code' smoke.log; then echo "the device code was printed"; ok=false; fi
+          if curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:14318/healthz; then echo "the server started before it was activated"; ok=false; fi
+          kill "$pid" || true
+          kill "$fake" || true
+          if [ "$ok" != true ]; then cat onboarding.log onboarding2.log no-eula.log smoke.log; exit 1; fi
+
+      # Footprint targets (docs/FOOTPRINT.md): the release binary may grow
+      # at most 10% over its baseline in packaging/size-baseline.json, and an
+      # idle client (Linux, measured from /proc) must stay under the memory
+      # limit there. It prints sizes only.
+      - name: Footprint check
+        run: |
+          case "${{ matrix.os }}" in
+            macos) bin="$RUNNER_TEMP/SpanDock.app/Contents/MacOS/SpanDock" ;;
+            linux) bin="$RUNNER_TEMP/spandock" ;;
+            windows) bin="$RUNNER_TEMP/spandock.exe" ;;
+          esac
+          go run scripts/footprint-check.go size "${{ matrix.os }}-${{ matrix.arch }}" "$bin"
+          if [ "${{ matrix.os }}" = linux ]; then go run scripts/footprint-check.go rss "$bin"; fi
+
+      - name: Upload release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: spandock-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # The Go tests in four parts per platform (scripts/test-shard.sh), beside
+  # the build job: they don't hold up packaging, but publishing needs them.
+  # Part 1 also runs every package other than the root one.
+  test:
+    name: Test ${{ matrix.os }} ${{ matrix.arch }} ${{ matrix.shard }}/${{ matrix.of }}
+    needs: plan
+    runs-on: ${{ (matrix.runner == 'macos-15' && vars.MAC_RUNNER && !inputs.publish) && fromJSON(vars.MAC_RUNNER) || matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.test) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Windows: Defender's real-time scan slows Go builds and tests a lot.
+      # Leave out the workspace, Go's build and module caches, the runner's
+      # temp folder and its tool cache (where setup-go installs Go). Quiet;
+      # an image without Defender doesn't fail the job.
+      - name: Leave Go's folders out of Defender (Windows)
+        if: matrix.os == 'windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $paths = @($env:GITHUB_WORKSPACE, $env:RUNNER_TEMP, $env:RUNNER_TOOL_CACHE, (Join-Path $env:LOCALAPPDATA 'go-build'), (Join-Path $env:USERPROFILE 'go'))
+          Add-MpPreference -ExclusionPath $paths -ErrorAction Stop
+          Write-Output "Defender exclusions added"
+
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          repository: SpanDock/spandock
+          ref: ${{ inputs.ref || 'main' }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify toolchain
+        run: |
+          test "$(go env GOARCH)" = "${{ matrix.arch }}"
+          go version
+          gcc --version | head -1
+
+      # THIRD_PARTY_NOTICES.txt lists the modules linked on every release
+      # platform, so one runner is enough to check it. It holds only
+      # license texts, so printing it is safe.
+      - name: Check third-party notices
+        if: matrix.os == 'linux' && matrix.arch == 'amd64' && matrix.shard == 1
+        run: |
+          go run scripts/third-party-notices.go
+          if ! git diff --stat --exit-code -- THIRD_PARTY_NOTICES.txt; then
+            echo "THIRD_PARTY_NOTICES.txt is stale: run 'go run scripts/third-party-notices.go' and commit it"
+            exit 1
+          fi
+
+      # A newer DuckDB than go.mod links: a warning on the run (nightly
+      # too), never a failure; the release checklist blocks on it. Prints
+      # version numbers only.
+      - name: Newer DuckDB
+        if: matrix.os == 'linux' && matrix.arch == 'amd64' && matrix.shard == 1
+        run: ./scripts/duckdb-check.sh --warn
+
+      # The Postgres settings tests need a real Postgres; a throwaway one
+      # runs on the Linux runners (its test password is not a secret).
+      - name: Postgres for tests (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          docker run -d --name pg -e POSTGRES_PASSWORD=test -p 127.0.0.1:55432:5432 postgres:17
+          for i in $(seq 1 30); do docker exec pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
+          echo "SPANDOCK_PG_TEST_DSN=postgres://postgres:test@127.0.0.1:55432/postgres" >> "$GITHUB_ENV"
+
+      # Every test runs in exactly one part: Go itself lists what each
+      # part's patterns select (prints counts only).
+      - name: Check the test parts
+        if: matrix.os == 'linux' && matrix.arch == 'amd64' && matrix.shard == 1
+        run: ./scripts/test-shard.sh -check ${{ matrix.of }}
+
+      - name: Test
+        # 20 minutes: Windows runners sometimes take over Go's default 10.
+        run: ./scripts/test-shard.sh ${{ matrix.shard }} ${{ matrix.of }} -timeout 20m
+
+  # The QA lab (docs/QA.md): a hub, satellites, clients, a phone and fakes
+  # on loopback, and the scenario suite against them. A release needs it
+  # green. Its output names scenarios, steps and scrubbed log lines only
+  # (these logs are public); the report (scrubbed) is kept, the raw logs
+  # never leave the runner. Every OS blocks, Windows included (docs/QA.md).
+  qa:
+    name: QA lab ${{ matrix.os }} ${{ matrix.shard }}
+    needs: plan
+    runs-on: ${{ (matrix.runner == 'macos-15' && vars.MAC_RUNNER && !inputs.publish) && fromJSON(vars.MAC_RUNNER) || matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The suite in parts side by side (qa/shard.go): eight on Linux, four
+        # on Windows, two on macOS (GitHub runs five macOS jobs at a time);
+        # fast runs Linux's first part only.
+        include: ${{ fromJSON(needs.plan.outputs.qa) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Windows: Defender's real-time scan slows Go builds and tests a lot.
+      # Leave out the workspace, Go's build and module caches, the runner's
+      # temp folder and its tool cache (where setup-go installs Go). Quiet;
+      # an image without Defender doesn't fail the job.
+      - name: Leave Go's folders out of Defender (Windows)
+        if: matrix.os == 'windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $paths = @($env:GITHUB_WORKSPACE, $env:RUNNER_TEMP, $env:RUNNER_TOOL_CACHE, (Join-Path $env:LOCALAPPDATA 'go-build'), (Join-Path $env:USERPROFILE 'go'))
+          Add-MpPreference -ExclusionPath $paths -ErrorAction Stop
+          Write-Output "Defender exclusions added"
+
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          repository: SpanDock/spandock
+          ref: ${{ inputs.ref || 'main' }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # The browser-extension-live scenario (qa/browser_live.go) drives the
+      # real extension in Chrome for Testing; Linux's parts install Node's
+      # test dependencies and the browser, and require it (elsewhere it is
+      # skipped). Prints nothing but npm's and the installer's own lines.
+      - name: Set up Node (Linux)
+        if: matrix.os == 'linux'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/browser-extension/tests/package-lock.json
+
+      - name: Install the browser extension's test browser (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          (cd packages/browser-extension/tests && npm ci --no-audit --no-fund)
+          echo "CHROME_PATH=$(packages/browser-extension/tests/chrome.sh)" >> "$GITHUB_ENV"
+          echo "QA_BROWSER_REQUIRED=1" >> "$GITHUB_ENV"
+
+      - name: Run the QA lab
+        run: go run ./qa -shard ${{ matrix.shard }}
+
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: qa-report-${{ matrix.os }}-${{ matrix.part }}
+          path: |
+            qa/out/report.md
+            qa/out/report.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  # The compatibility matrix (docs/QA.md, docs/COMPATIBILITY.md): this
+  # source with the published binaries of the two previous minor versions,
+  # both ways. Nightly, when asked (compat), and before publishing. Its
+  # output is the QA lab's (scrubbed: these logs are public); GITHUB_TOKEN
+  # only lists this repository's releases.
+  qa-compat:
+    name: Compatibility ${{ matrix.os }}
+    needs: plan
+    if: github.event_name == 'schedule' || inputs.compat || inputs.publish
+    runs-on: ${{ (matrix.runner == 'macos-15' && vars.MAC_RUNNER && !inputs.publish) && fromJSON(vars.MAC_RUNNER) || matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.compat) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          repository: SpanDock/spandock
+          ref: ${{ inputs.ref || 'main' }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # Older versions' hubs built from their tags, and the downloaded
+      # releases: they never change, so each run starts from the last one's.
+      - name: Restore the older versions
+        uses: actions/cache@v6
+        with:
+          path: qa/cache
+          key: qa-compat-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: qa-compat-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Run the compatibility matrix
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: make qa-compat
+
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: qa-compat-report-${{ matrix.os }}
+          path: |
+            qa/out/compat/report.md
+            qa/out/compat/report.json
+            qa/out/compat/*/report.md
+            qa/out/compat/*/report.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Leave out the sources
+        if: always()
+        run: rm -rf qa/cache/_src
+
+  # The browser extension (packages/browser-extension, docs/BROWSER_EXTENSION.md):
+  # its unit tests (jsdom fixtures), the kit's tests (reference receiver, CLI
+  # installers) and the e2e in Chrome for Testing against local fixtures,
+  # which never reaches a real site. Its output is test names and results only.
+  browser-extension:
+    name: Browser extension
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          repository: SpanDock/spandock
+          ref: ${{ inputs.ref || 'main' }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/browser-extension/tests/package-lock.json
+
+      - name: Install the test dependencies
+        working-directory: packages/browser-extension/tests
+        run: npm ci --no-audit --no-fund
+
+      # Chrome for Testing (branded Chrome ignores --load-extension), from
+      # Google's public download bucket through @puppeteer/browsers.
+      - name: Install Chrome for Testing
+        id: chrome
+        run: echo "path=$(packages/browser-extension/tests/chrome.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+        run: packages/browser-extension/tests/run_all.sh
+
+  # The live adapter smoke test (docs/BROWSER_EXTENSION.md "The smoke test"):
+  # the extension in Chrome for Testing on the landing pages of the AI chat
+  # sites that work signed out. It never types, sends or signs in, and
+  # prints a per-site table of statuses and counts only (no page text). A
+  # site that blocks headless browsers is "blocked", not a failure; the job
+  # fails only when an adapter no longer recognizes its site. Not a release
+  # gate: third-party sites change on their own schedule.
+  extension-smoke:
+    name: Browser extension smoke
+    needs: plan
+    if: github.event_name == 'schedule' || inputs.smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          repository: SpanDock/spandock
+          ref: ${{ inputs.ref || 'main' }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/browser-extension/tests/package-lock.json
+
+      - name: Install the test dependencies
+        working-directory: packages/browser-extension/tests
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Chrome for Testing
+        id: chrome
+        run: echo "path=$(packages/browser-extension/tests/chrome.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test the adapters on the live sites
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+        run: node packages/browser-extension/tests/smoke_live.js
+
+  release:
+    name: Publish release
+    if: inputs.publish && startsWith(inputs.ref, 'v')
+    needs: [plan, build, test, qa, qa-compat, browser-extension]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          repository: SpanDock/spandock
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+          path: source
+
+      - name: Download release files
+        uses: actions/download-artifact@v7
+        with:
+          pattern: spandock-*
+          path: release
+          merge-multiple: true
+
+      - name: Combine checksums and write notes
+        env:
+          TAG: ${{ inputs.ref }}
+        run: |
+          case "$TAG" in v[0-9]*) ;; *) echo "invalid tag $TAG"; exit 1 ;; esac
+          test "$(git -C source describe --tags --exact-match HEAD)" = "$TAG"
+          cat release/checksums-*.txt | sort -k2 > release/checksums.txt
+          rm release/checksums-*.txt
+          (cd release && sha256sum -c checksums.txt)
+          previous=$(git -C source describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)
+          {
+            echo "## SpanDock ${TAG}"
+            echo
+            echo "Download the DMG for your Mac (arm64 for Apple Silicon, amd64 for Intel), or the archive for Linux or Windows."
+            echo "Installed apps update themselves; checksums are in checksums.txt."
+            echo
+            echo "### Changes"
+            git -C source log --no-merges --pretty='- %s' ${previous:+"$previous..$TAG"}
+          } > notes.md
+          # Installed apps show these notes (Settings → Updates), fetched by tag
+          # from the download URL, which unlike the API is not rate limited.
+          cp notes.md release/RELEASE_NOTES.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.ref }}
+        run: |
+          flags=(--latest)
+          case "$TAG" in *-*) flags=(--prerelease --latest=false) ;; esac
+          # Re-running a release replaces it, so a fixed build can be republished.
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" release/* --target main --title "SpanDock $TAG" --notes-file notes.md "${flags[@]}"
+
+      # The Homebrew tap (SpanDock/homebrew-spandock) gets this release's cask
+      # and formula. TAP_DEPLOY_KEY can write only to the tap. Prereleases
+      # are skipped, so `brew upgrade` follows stable releases.
+      - name: Update the Homebrew tap
+        if: ${{ !contains(inputs.ref, '-') }}
+        env:
+          TAP_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+          TAG: ${{ inputs.ref }}
+        run: |
+          if [ -z "$TAP_KEY" ]; then echo "TAP_DEPLOY_KEY is not set; skipping the tap"; exit 0; fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$TAP_KEY" > ~/.ssh/tap
+          chmod 600 ~/.ssh/tap
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone -q git@github.com:SpanDock/homebrew-spandock.git tap
+          sh source/packaging/homebrew/render.sh "${TAG#v}" release/checksums.txt tap
+          cd tap
+          git add -A
+          if git diff --cached --quiet; then echo "The tap is already at $TAG"; exit 0; fi
+          git -c user.name="SpanDock release" -c user.email="releases@users.noreply.github.com" commit -q -m "SpanDock ${TAG#v}"
+          git push -q origin HEAD:main
+          rm -f ~/.ssh/tap
+
+      # Last, so a failed push never holds up the release or the tap.
+      # The container image (ghcr.io/spandock/spandock, packaging/docker/Dockerfile) from this
+      # release's checksummed Linux binaries, for amd64 and arm64; tagged with the version and,
+      # for a stable release, latest. Prereleases get their version tag only.
+      - name: Container image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.ref }}
+        run: |
+          mkdir -p image/bin/amd64 image/bin/arm64
+          tar -xzf release/spandock-linux-amd64.tar.gz -C image/bin/amd64 spandock
+          tar -xzf release/spandock-linux-arm64.tar.gz -C image/bin/arm64 spandock
+          cp source/packaging/docker/Dockerfile image/
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker buildx create --use >/dev/null
+          tags=(-t "ghcr.io/spandock/spandock:${TAG#v}")
+          case "$TAG" in *-*) ;; *) tags+=(-t ghcr.io/spandock/spandock:latest) ;; esac
+          docker buildx build --platform linux/amd64,linux/arm64 --push "${tags[@]}" \
+            --label org.opencontainers.image.source=https://github.com/SpanDock/spandock-releases \
+            --label org.opencontainers.image.version="${TAG#v}" \
+            --label org.opencontainers.image.description="SpanDock server" image
+          docker logout ghcr.io
+
+      # The Helm chart (packaging/helm/spandock) as an OCI artifact, ghcr.io/spandock/charts/spandock,
+      # versioned with the release (its default image tag is the same version).
+      - name: Helm chart
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.ref }}
+        run: |
+          echo "$GH_TOKEN" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          helm package source/packaging/helm/spandock --version "${TAG#v}" --app-version "${TAG#v}" -d chart >/dev/null
+          helm push "chart/spandock-${TAG#v}.tgz" oci://ghcr.io/spandock/charts
+          helm registry logout ghcr.io
+
+      # This repository's README.md and docs/DEPLOY.md come from the source
+      # (packaging/releases-repo), so the public install and deploy guides
+      # follow the release. Only those two files; a failure here never fails
+      # the release. Prints whether they changed, never their content.
+      - name: Check out this repository's main
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: public
+
+      - name: Sync the public docs
+        continue-on-error: true
+        env:
+          TAG: ${{ inputs.ref }}
+        run: |
+          test -d public/.git || { echo "No checkout of main; the docs stay as they are"; exit 0; }
+          mkdir -p public/docs
+          cp source/packaging/releases-repo/README.md public/README.md
+          cp source/packaging/releases-repo/docs/DEPLOY.md public/docs/DEPLOY.md
+          cd public
+          git add README.md docs/DEPLOY.md
+          if git diff --cached --quiet; then echo "README.md and docs/DEPLOY.md are current"; exit 0; fi
+          git -c user.name="SpanDock release" -c user.email="releases@users.noreply.github.com" commit -q -m "Docs from SpanDock $TAG"
+          git push -q origin HEAD:main
+          echo "Updated README.md and docs/DEPLOY.md"
+
+      # channels.json on this repository's main (internal/channels,
+      # docs/plans/RELEASE_CHANNELS.md): the Stable and Release candidate
+      # versions and each version line's support dates, which installed apps
+      # read instead of GitHub's rate-limited API. Built from the published
+      # releases and packaging/release-lines.json; Stable and LTS never go
+      # back. A failure here never fails the release: apps then ask the API,
+      # as before. Prints the channels' versions only.
+      - name: Set up Go for the channel list
+        continue-on-error: true
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: source/go.mod
+          cache: false
+
+      - name: Update the channel list
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.ref }}
+        run: |
+          test -d public/.git || { echo "No checkout of main; the channel list stays as it is"; exit 0; }
+          git -C public pull -q --ff-only origin main || true
+          gh release list -L 1000 --json tagName,isPrerelease,isDraft,publishedAt > releases.json
+          (cd source && go run scripts/release-channels.go -releases ../releases.json -policy packaging/release-lines.json \
+            -previous ../public/channels.json -tag "$TAG" -notes ../notes.md -out ../public/channels.json)
+          cd public
+          git add channels.json
+          if git diff --cached --quiet; then echo "channels.json is current"; exit 0; fi
+          git -c user.name="SpanDock release" -c user.email="releases@users.noreply.github.com" commit -q -m "Channels after SpanDock $TAG"
+          git push -q origin HEAD:main
